@@ -1,10 +1,34 @@
 #include "common.h"
 #include "util.h"
 
+#include <cuda_fp16.h>
 #include <chrono>
 #include <iostream>  // debug
+#include <string>
 
-struct LSTMWrapper {
+template <typename T>
+struct DataType {};
+
+template <>
+struct DataType<float> {
+  cudnnDataType_t data_type = CUDNN_DATA_FLOAT;
+  cudnnDataType_t math_precison = CUDNN_DATA_FLOAT;
+  cudnnMathType_t math_type = CUDNN_DEFAULT_MATH;
+  cudnnRNNAlgo_t rnn_algo = CUDNN_RNN_ALGO_STANDARD;
+  std::string suffix = ".0";
+};
+
+template <>
+struct DataType<half> {
+  cudnnDataType_t data_type = CUDNN_DATA_HALF;
+  cudnnDataType_t math_precison = CUDNN_DATA_HALF;
+  cudnnMathType_t math_type = CUDNN_TENSOR_OP_MATH;
+  cudnnRNNAlgo_t rnn_algo = CUDNN_RNN_ALGO_STANDARD;
+  std::string suffix = ".1";
+};
+
+template <typename T>
+struct LSTMWrapper : public DataType<T> {
   // common data
   cudnnHandle_t cudnn_handle;
 
@@ -18,13 +42,11 @@ struct LSTMWrapper {
   // the recurrent projection feature is disabled.
   int proj_size = hidden_size;
 
-  // single-precision
-  cudnnDataType_t data_type = CUDNN_DATA_FLOAT;
-  cudnnDataType_t math_precison = CUDNN_DATA_FLOAT;
-  cudnnMathType_t math_type = CUDNN_DEFAULT_MATH;
-
-  // use standard rnn algorithm
-  cudnnRNNAlgo_t rnn_algo = CUDNN_RNN_ALGO_STANDARD;
+  cudnnDataType_t data_type = DataType<T>::data_type;
+  cudnnDataType_t math_precison = DataType<T>::math_precison;
+  cudnnMathType_t math_type = DataType<T>::math_type;
+  cudnnRNNAlgo_t rnn_algo = DataType<T>::rnn_algo;
+  std::string suffix = DataType<T>::suffix;
 
   cudnnRNNDataDescriptor_t xdesc;
   cudnnRNNDataDescriptor_t ydesc;
@@ -45,19 +67,21 @@ struct LSTMWrapper {
   cudnnDropoutDescriptor_t dropout_desc = nullptr;
 
   // input and hx, cx, ...
-  float *d_input = nullptr;
-  float *d_output = nullptr;
-  float *d_hx = nullptr;
-  float *d_cx = nullptr;
+  T *d_input = nullptr;
+  T *d_output = nullptr;
+  T *d_hx = nullptr;
+  T *d_cx = nullptr;
+
+  int *seq_length_array = nullptr;
   int *dev_seq_lenghts = nullptr;
 
   size_t weight_space_size = 0;
   size_t workspace_size = 0;
   size_t reserve_space_size = 0;
 
-  float *d_weight_space = nullptr;
-  float *d_workspace = nullptr;
-  float *d_reserve_space = nullptr;
+  T *d_weight_space = nullptr;
+  void *d_workspace = nullptr;
+  void *d_reserve_space = nullptr;
 
   LSTMWrapper() {
     CUDNN_CHECK(cudnnCreate(&cudnn_handle));
@@ -69,21 +93,44 @@ struct LSTMWrapper {
     CUDNN_CHECK(cudnnCreateRNNDescriptor(&rnn_desc));
   }
 
-  ~LSTMWrapper() { CUDNN_CHECK(cudnnDestroy(cudnn_handle)); }
+  ~LSTMWrapper() {
+    delete[] seq_length_array;
+    CUDA_CHECK(cudaFree(dev_seq_lenghts));
+    CUDA_CHECK(cudaFree(d_input));
+    CUDA_CHECK(cudaFree(d_output));
+    CUDA_CHECK(cudaFree(d_hx));
+    CUDA_CHECK(cudaFree(d_cx));
+
+    if (workspace_size > 0) {
+      CUDA_CHECK(cudaFree(d_weight_space));
+    }
+    if (reserve_space_size > 0) {
+      CUDA_CHECK(cudaFree(d_reserve_space));
+    }
+
+    CUDNN_CHECK(cudnnDestroyRNNDataDescriptor(xdesc));
+    CUDNN_CHECK(cudnnDestroyRNNDataDescriptor(ydesc));
+    CUDNN_CHECK(cudnnDestroyTensorDescriptor(hdesc));
+    CUDNN_CHECK(cudnnDestroyTensorDescriptor(cdesc));
+    CUDNN_CHECK(cudnnDestroyRNNDescriptor(rnn_desc));
+    CUDNN_CHECK(cudnnDestroyDropoutDescriptor(dropout_desc));
+    CUDNN_CHECK(cudnnDestroy(cudnn_handle));
+  }
 
   void Init() {
-    CUDA_CHECK(cudaMalloc(&d_input, sizeof(float) * seq_len * batch_size * input_size));
-    CUDA_CHECK(cudaMalloc(&d_output, sizeof(float) * seq_len * batch_size * 2 * hidden_size));
-    CUDA_CHECK(cudaMalloc(&d_hx, sizeof(float) * 2 * batch_size * hidden_size));
-    CUDA_CHECK(cudaMalloc(&d_cx, sizeof(float) * 2 * batch_size * hidden_size));
-    CUDA_CHECK(cudaMemset(d_hx, 0, sizeof(float) * 2 * batch_size * hidden_size));
-    CUDA_CHECK(cudaMemset(d_cx, 0, sizeof(float) * 2 * batch_size * hidden_size));
+    CUDA_CHECK(cudaMalloc(&d_input, sizeof(T) * seq_len * batch_size * input_size));
+    CUDA_CHECK(cudaMalloc(&d_output, sizeof(T) * seq_len * batch_size * 2 * hidden_size));
+    CUDA_CHECK(cudaMalloc(&d_hx, sizeof(T) * 2 * batch_size * hidden_size));
+    CUDA_CHECK(cudaMalloc(&d_cx, sizeof(T) * 2 * batch_size * hidden_size));
+
+    CUDA_CHECK(cudaMemset(d_hx, 0, sizeof(T) * 2 * batch_size * hidden_size));
+    CUDA_CHECK(cudaMemset(d_cx, 0, sizeof(T) * 2 * batch_size * hidden_size));
 
     // read inputs
-    util::ReadRawDataToGPU("../data/input.data", d_input);
+    util::ReadRawDataToGPU("../data/input" + suffix + ".data", d_input);
 
     // sequence length
-    int *seq_length_array = new int[batch_size];
+    seq_length_array = new int[batch_size];
     for (int i = 0; i < batch_size; ++i) {
       seq_length_array[i] = seq_len;
     }
@@ -156,15 +203,15 @@ struct LSTMWrapper {
     CUDNN_CHECK(cudnnCreateTensorDescriptor(&b_desc));
 
     // for LSTM, GEMM number is 8
-    int num_linear_layers = 8;
+    const int num_linear_layers = 8;
 
     for (int layer = 0; layer < num_layers * 2; ++layer) {
       for (int linear_op_id = 0; linear_op_id < num_linear_layers; ++linear_op_id) {
         cudnnDataType_t data_type_temp;
         int nbDims = 0;
         int dim[3], stride[3];
-        float *linLayerMat = NULL;
-        float *linLayerBias = NULL;
+        T *linLayerMat = NULL;
+        T *linLayerBias = NULL;
 
         CUDNN_CHECK(cudnnGetRNNWeightParams(cudnn_handle, rnn_desc, layer, weight_space_size,
                                             d_weight_space, linear_op_id, w_desc,
@@ -176,7 +223,7 @@ struct LSTMWrapper {
           std::string name =
               std::to_string(layer) + std::to_string(linear_op_id) + std::to_string(0);
 
-          util::ReadRawDataToGPU("../data/" + name + ".data", linLayerMat);
+          util::ReadRawDataToGPU("../data/" + name + suffix + ".data", linLayerMat);
         }
 
         if (linLayerBias) {
@@ -185,13 +232,13 @@ struct LSTMWrapper {
           std::string name =
               std::to_string(layer) + std::to_string(linear_op_id) + std::to_string(1);
 
-          util::ReadRawDataToGPU("../data/" + name + ".data", linLayerBias);
+          util::ReadRawDataToGPU("../data/" + name + suffix + ".data", linLayerBias);
         }
       }
     }
 
-    cudnnDestroyTensorDescriptor(w_desc);
-    cudnnDestroyTensorDescriptor(b_desc);
+    CUDNN_CHECK(cudnnDestroyTensorDescriptor(w_desc));
+    CUDNN_CHECK(cudnnDestroyTensorDescriptor(b_desc));
   }
 
   void DoForward() {
@@ -220,22 +267,32 @@ struct LSTMWrapper {
 
       std::cout << time << " ms" << std::endl;
     }
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
   }
 
   void SaveOutput() {
-    util::SaveGPUToFile("../data/output_cudnn.data", d_output,
+    util::SaveGPUToFile("../data/output_cudnn" + suffix + ".data", d_output,
                         seq_len * batch_size * 2 * hidden_size);
   }
 };
 
-int main() {
-  LSTMWrapper cudnn_lstm;
-
+template <typename T>
+void Test() {
+  LSTMWrapper<T> cudnn_lstm;
   cudnn_lstm.Init();
-
   cudnn_lstm.DoForward();
-
   cudnn_lstm.SaveOutput();
+}
+
+int main(int argc, char *argv[]) {
+  std::cout << "benmarking float-32 preicision" << std::endl;
+  Test<float>();
+  std::cout << std::endl;
+
+  std::cout << "benmarking half preicision" << std::endl;
+  Test<half>();
 
   return 0;
 }

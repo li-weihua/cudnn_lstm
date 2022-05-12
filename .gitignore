@@ -1,7 +1,7 @@
 compile_commands.json
 *.swp
+*.data
 
 .cache/
 __pycache__/
 build/
-data/
